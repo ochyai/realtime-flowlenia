@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+venv/
+.DS_Store
+output/
+temp_frames/
+*.png
+*.mp4
+*.gif
