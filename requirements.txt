@@ -1,3 +1,7 @@
 torch>=2.0
 opencv-python>=4.8
 numpy>=1.24
+# Optional: CoreML acceleration on macOS
+# coremltools>=7.0
+# Optional: demo GIF recording
+# Pillow>=9.0

@@ -7,3 +7,4 @@ temp_frames/
 *.png
 *.mp4
 *.gif
+!demo.gif

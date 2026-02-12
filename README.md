@@ -3,7 +3,6 @@
 GPU-accelerated real-time [Flow Lenia](https://arxiv.org/abs/2212.07906) simulation with liquid shader effects.
 
 ![Demo](demo.gif)
-<!-- Replace demo.gif with an actual recording -->
 
 ## Features
 
@@ -13,6 +12,7 @@ GPU-accelerated real-time [Flow Lenia](https://arxiv.org/abs/2212.07906) simulat
 - **Multiple render modes** -- monochrome, warm amber, full liquid shader, direct RGB
 - **Interactive controls** -- pause, reset, pattern switching, mouse perturbation
 - **Real-time performance** -- 512x512 at 30+ FPS on MPS, higher on CUDA
+- **CoreML optimization** -- mixed-precision (float16) simulation + optional ANE rendering offload on macOS
 
 ## Requirements
 
@@ -37,6 +37,13 @@ pip install -r requirements.txt
 python realtime_flowlenia_gpu.py
 ```
 
+**CoreML-optimized version** (macOS — float16 + ANE rendering):
+
+```bash
+pip install coremltools  # optional, for ANE acceleration
+python realtime_flowlenia_coreml.py
+```
+
 **CPU fallback version** (uses the engine with reintegration tracking):
 
 ```bash
@@ -58,14 +65,17 @@ python realtime_flowlenia.py
 | `g` | Toggle glow effect |
 | `t` | Toggle thin-film interference |
 | `d` | Toggle fluid distortion |
+| `b` | Run benchmark (CoreML version) |
 | `1`-`5` | Switch initial pattern |
 | Mouse click | Add perturbation |
 
 ## Architecture
 
 - `realtime_flowlenia_gpu.py` -- Self-contained GPU implementation with `grid_sample` advection and liquid shader effects (main entry point)
+- `realtime_flowlenia_coreml.py` -- CoreML-optimized version: mixed-precision float16 simulation, optional ANE rendering offload, `torch.compile` fusion
 - `realtime_flowlenia_engine.py` -- Engine with proper reintegration tracking transport
 - `realtime_flowlenia.py` -- CPU-friendly viewer using the engine
+- `record_demo.py` -- Headless demo GIF recorder
 
 ## Citation
 
