@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """CoreML-optimized Flow Lenia for macOS.
 
-Performance optimizations over realtime_flowlenia_gpu.py:
-  1. Mixed-precision (float16) — ~1.5-2x MPS throughput
-  2. CoreML rendering on Apple Neural Engine — GPU freed for simulation
-  3. torch.compile graph fusion (when available)
-  4. Pre-allocated buffers to reduce allocation overhead
+Performance optimizations:
+  1. Simulation at 512x512 with display upscale to 1024
+  2. Mixed-precision — fp16 growth math + grid_sample data, fp32 coordinates
+  3. CoreML rendering on Apple Neural Engine (optional)
+  4. torch.compile graph fusion
 
-Requires: pip install coremltools  (optional — falls back to MPS rendering)
+Features:
+  - Auto-evolving parameters with smooth interpolation
+  - Pattern crossfade transitions
+  - Liquid shader effects (distortion, thin-film, glow)
 
 Controls:
   SPACE  = pause/resume    r = reset    q/ESC = quit
@@ -15,6 +18,7 @@ Controls:
   +/- = sim steps/frame    m = toggle modulation
   g = toggle glow          t = toggle thin-film
   d = toggle fluid distort b = benchmark mode
+  e = toggle auto-evolution
   1-5 = switch pattern     mouse click = perturbation
 """
 
@@ -51,7 +55,7 @@ except ImportError:
 
 @dataclass
 class Cfg:
-    X: int = 512
+    X: int = 512          # simulation resolution
     Y: int = 512
     C: int = 3
     k: int = 9
@@ -61,6 +65,13 @@ class Cfg:
     diffusion: float = 0.005
     mod_speed: float = 1.0
     mod_depth: float = 0.4
+    # Evolution
+    evolve_interval: float = 20.0   # seconds between parameter transitions
+    evolve_duration: float = 5.0    # seconds for smooth transition
+    crossfade_duration: float = 3.0 # seconds for pattern crossfade
+
+
+DISPLAY_SIZE = 1024
 
 
 def conn_from_matrix(mat):
@@ -82,23 +93,17 @@ def conn_from_matrix(mat):
 # ══════════════════════════════════════════════════════════════════════
 
 class ToneMapGlowModule(torch.nn.Module):
-    """Tone mapping + glow bloom — designed for CoreML ANE conversion.
-
-    Runs on Apple Neural Engine, freeing the GPU for simulation.
-    """
+    """Tone mapping + glow bloom — designed for CoreML ANE conversion."""
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        # img: (1, 3, H, W)
         out = img.clamp(0.0, 1.0) * 2.5
         out = out / (1.0 + out)
         out = out * out * (3.0 - 2.0 * out)
 
-        # Saturation boost
         lum = 0.299 * out[:, 0:1] + 0.587 * out[:, 1:2] + 0.114 * out[:, 2:3]
         out = lum + (out - lum) * 1.8
         out = out.clamp(0.0, 1.0)
 
-        # Glow (two-layer bloom)
         bright = (out - 0.3).clamp(min=0.0) * 1.5
         s1 = F.avg_pool2d(bright, 4, stride=4)
         g1 = F.interpolate(s1, size=(img.shape[2], img.shape[3]),
@@ -111,7 +116,6 @@ class ToneMapGlowModule(torch.nn.Module):
 
 
 def build_coreml_render_model(X: int, Y: int):
-    """Convert ToneMapGlow to a CoreML mlprogram for ANE."""
     if not HAS_COREML:
         return None
     try:
@@ -132,11 +136,97 @@ def build_coreml_render_model(X: int, Y: int):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Engine — float16 optimized
+#  Parameter Evolution
+# ══════════════════════════════════════════════════════════════════════
+
+class ParamEvolver:
+    """Smoothly evolves Lenia parameters over time."""
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        self.evolving = True
+        self._last_evolve = time.perf_counter()
+        self._transition_start = None
+        self._target_params = None
+        self._source_params = None
+
+    def _snapshot_params(self, fl):
+        return {
+            'R': fl.R.clone(),
+            'r': fl.r.clone(),
+            'm0': fl.m0.clone(),
+            's0': fl.s0.clone(),
+            'h0': fl.h0.clone(),
+            'a': fl.a.clone(),
+            'b': fl.b.clone(),
+            'w': fl.w.clone(),
+        }
+
+    def _generate_target(self, fl):
+        D = fl.device
+        k = fl.cfg.k
+        return {
+            'R': torch.empty((), device=D).uniform_(8.0, 20.0),
+            'r': torch.empty(k, device=D).uniform_(0.2, 1.0),
+            'm0': torch.empty(k, device=D).uniform_(0.05, 0.5),
+            's0': torch.empty(k, device=D).uniform_(0.001, 0.18),
+            'h0': torch.empty(k, device=D).uniform_(0.01, 1.0),
+            'a': torch.empty(k, 3, device=D).uniform_(0.0, 1.0),
+            'b': torch.empty(k, 3, device=D).uniform_(0.001, 1.0),
+            'w': torch.empty(k, 3, device=D).uniform_(0.01, 0.5),
+        }
+
+    def _apply_lerp(self, fl, alpha):
+        src, tgt = self._source_params, self._target_params
+        # Smooth ease in/out
+        t = alpha * alpha * (3.0 - 2.0 * alpha)
+        for key in src:
+            val = src[key] * (1 - t) + tgt[key] * t
+            setattr(fl, key, val)
+
+    def update(self, fl):
+        if not self.evolving:
+            return False
+
+        now = time.perf_counter()
+
+        if self._transition_start is not None:
+            elapsed = now - self._transition_start
+            duration = self.cfg.evolve_duration
+            if elapsed < duration:
+                alpha = elapsed / duration
+                self._apply_lerp(fl, alpha)
+                return True
+            else:
+                # Transition complete
+                self._apply_lerp(fl, 1.0)
+                self._transition_start = None
+                self._last_evolve = now
+                return True
+
+        if now - self._last_evolve >= self.cfg.evolve_interval:
+            self._source_params = self._snapshot_params(fl)
+            self._target_params = self._generate_target(fl)
+            self._transition_start = now
+            return True
+
+        return False
+
+    @property
+    def transitioning(self):
+        return self._transition_start is not None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Engine — mixed-precision optimized
 # ══════════════════════════════════════════════════════════════════════
 
 class FlowLeniaCoreML:
-    """Flow Lenia engine with mixed-precision + CoreML optimizations."""
+    """Flow Lenia engine with surgical mixed-precision.
+
+    Float16: growth function (exp, matmul), grid_sample data.
+    Float32: position grids, grid_sample coords, conv weights, FFT.
+    """
 
     def __init__(self, cfg: Cfg, seed: int = 0):
         self.cfg = cfg
@@ -146,7 +236,6 @@ class FlowLeniaCoreML:
         torch.manual_seed(seed)
         k, C = cfg.k, cfg.C
 
-        # Parameters (float32 — converted to fp16 in step)
         self.R = torch.empty((), device=D).uniform_(8.0, 20.0)
         self.r = torch.empty(k, device=D).uniform_(0.2, 1.0)
         self.m0 = torch.empty(k, device=D).uniform_(0.05, 0.5)
@@ -164,8 +253,6 @@ class FlowLeniaCoreML:
             for ki in c1l[c]:
                 c1m[ki, c] = 1.0
         self._c1 = c1m
-
-        # Half-precision copies of connection matrix
         self._c1_h = c1m.half() if USE_FP16 else c1m
 
         # Modulation harmonics
@@ -185,7 +272,7 @@ class FlowLeniaCoreML:
         self._mdt = mk((1, nh), 0.001, 0.008)
         self._mflow = mk((1, nh), 0.002, 0.012)
 
-        # Sobel weights (keep float32 + half copies)
+        # Sobel weights (float32)
         kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                           dtype=torch.float32, device=D)
         ky = kx.t().contiguous()
@@ -194,33 +281,28 @@ class FlowLeniaCoreML:
             wc[c, 0] = ky
             wc[C + c, 0] = kx
         self._sw_c = wc
-        self._sw_c_h = wc.half() if USE_FP16 else wc
         w1 = torch.zeros(2, 1, 3, 3, device=D)
         w1[0, 0] = ky
         w1[1, 0] = kx
         self._sw_1 = w1
-        self._sw_1_h = w1.half() if USE_FP16 else w1
 
-        # Laplacian
+        # Laplacian (float32)
         lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]],
                            dtype=torch.float32, device=D)
         self._lw = lap.view(1, 1, 3, 3).expand(C, 1, 3, 3).clone()
-        self._lw_h = self._lw.half() if USE_FP16 else self._lw
 
-        # Position grids
+        # Position grids (float32 — critical for smooth grid_sample)
         X, Y = cfg.X, cfg.Y
         gi, gj = torch.meshgrid(
             torch.arange(X, device=D, dtype=torch.float32),
             torch.arange(Y, device=D, dtype=torch.float32), indexing="ij")
         self._pi = gi.unsqueeze(-1)
         self._pj = gj.unsqueeze(-1)
-        # Half-precision copies
-        self._pi_h = self._pi.half() if USE_FP16 else self._pi
-        self._pj_h = self._pj.half() if USE_FP16 else self._pj
 
         self.modulation_on = True
+        self._fK_dirty = True  # recompute kernel when params change
 
-        # Try torch.compile
+        # torch.compile
         self._compiled = False
         if hasattr(torch, "compile"):
             try:
@@ -253,6 +335,7 @@ class FlowLeniaCoreML:
             ker = (self.b[ki] * torch.exp(-((D3 - self.a[ki]) ** 2) / self.w[ki])).sum(-1)
             K[:, :, ki] = sig * ker
         K = K / K.sum(dim=(0, 1), keepdim=True).clamp(min=1e-10)
+        self._fK_dirty = False
         return torch.fft.fft2(torch.fft.fftshift(K, dim=(0, 1)), dim=(0, 1))
 
     @torch.no_grad()
@@ -295,35 +378,43 @@ class FlowLeniaCoreML:
             return A
         return torch.rand(X, Y, C, device=DEVICE) * 0.3
 
-    def _step_core_impl(self, U_h, A_h, m_h, s_h, h_h, dt_mod_h, flow_scale_h,
-                        sw_c, sw_1, lw, c1, pi, pj, X_f, Y_f, C, cfg_growth, cfg_diff):
-        """Core computation in half precision. Separated for torch.compile."""
-        # Growth
-        G = (torch.exp(-((U_h - m_h) ** 2) / (2 * s_h ** 2)) * 2 - 1) * h_h
-        Gc = torch.matmul(G, c1)
+    def _step_core_impl(self, U, A, A_h, m_h, s_h, h_h, c1_h,
+                        sw_c, sw_1, lw, pi, pj,
+                        dt_mod, flow_scale, X_f, Y_f, C,
+                        cfg_growth, cfg_diff):
+        """Core step: fp16 growth math + fp16 grid_sample data, fp32 coords."""
+        # ── Growth in fp16 ──
+        if USE_FP16:
+            U_h = U.half()
+            G = (torch.exp(-((U_h - m_h) ** 2) / (2 * s_h ** 2)) * 2 - 1) * h_h
+            Gc = torch.matmul(G, c1_h).float()
+        else:
+            G = (torch.exp(-((U - m_h) ** 2) / (2 * s_h ** 2)) * 2 - 1) * h_h
+            Gc = torch.matmul(G, c1_h)
 
-        # Sobel on Gc
+        # ── Sobel on Gc (float32) ──
         inp_gc = F.pad(Gc.permute(2, 0, 1).unsqueeze(0), (1, 1, 1, 1), mode="circular")
         o_gc = F.conv2d(inp_gc.repeat(1, 2, 1, 1), sw_c, groups=2 * C).squeeze(0)
         nG = torch.stack([o_gc[:C].permute(1, 2, 0), o_gc[C:].permute(1, 2, 0)], dim=2)
 
-        # Sobel on sum(A)
-        A_sum = A_h.sum(-1, keepdim=True)
+        # ── Sobel on sum(A) (float32) ──
+        A_sum = A.sum(-1, keepdim=True)
         inp_a = F.pad(A_sum.permute(2, 0, 1).unsqueeze(0), (1, 1, 1, 1), mode="circular")
         o_a = F.conv2d(inp_a.repeat(1, 2, 1, 1), sw_1, groups=2).squeeze(0)
         nA_sob = o_a.permute(1, 2, 0).unsqueeze(-1)
 
-        # Flow field
-        al = (A_h[:, :, None, :] / C).square().clamp(0.0, 1.0)
-        Ff = (nG * (1 - al) - nA_sob * al) * flow_scale_h
+        # ── Flow field (float32) ──
+        al = (A[:, :, None, :] / C).square().clamp(0.0, 1.0)
+        Ff = (nG * (1 - al) - nA_sob * al) * flow_scale
 
-        # grid_sample advection
+        # ── grid_sample advection: fp32 coords, fp16 data ──
         fi, fj = Ff[:, :, 0, :], Ff[:, :, 1, :]
-        si = (pi - dt_mod_h * fi) % X_f
-        sj = (pj - dt_mod_h * fj) % Y_f
+        si = (pi - dt_mod * fi) % X_f
+        sj = (pj - dt_mod * fj) % Y_f
 
         pad = 2
-        A_in = A_h.permute(2, 0, 1).unsqueeze(1)
+        # Use fp16 data for grid_sample (coords stay fp32)
+        A_in = A_h.permute(2, 0, 1).unsqueeze(1) if USE_FP16 else A.permute(2, 0, 1).unsqueeze(1)
         A_pad = F.pad(A_in, (pad, pad, pad, pad), mode="circular")
         XP = X_f + 2 * pad
         YP = Y_f + 2 * pad
@@ -334,16 +425,16 @@ class FlowLeniaCoreML:
 
         nw = F.grid_sample(A_pad, grids, mode='bilinear',
                            padding_mode='zeros', align_corners=True)
-        nw = nw.squeeze(1).permute(1, 2, 0)
+        nw = nw.squeeze(1).permute(1, 2, 0).float()
 
-        # Growth injection
-        nw = nw + dt_mod_h * cfg_growth * Gc
+        # ── Growth injection ──
+        nw = nw + dt_mod * cfg_growth * Gc
 
-        # Diffusion
+        # ── Diffusion ──
         if cfg_diff > 0:
             lap_inp = F.pad(nw.permute(2, 0, 1).unsqueeze(0), (1, 1, 1, 1), mode="circular")
             lap_out = F.conv2d(lap_inp, lw, groups=C).squeeze(0).permute(1, 2, 0)
-            nw = nw + dt_mod_h * cfg_diff * lap_out
+            nw = nw + dt_mod * cfg_diff * lap_out
 
         return nw
 
@@ -353,7 +444,6 @@ class FlowLeniaCoreML:
         X, Y, C = cfg.X, cfg.Y, cfg.C
         self.t += 1.0
 
-        # Modulated params (float32 — cheap, few elements)
         m = self._mod(self.m0, self._mm, 0.15).view(1, 1, -1)
         s = self._mod(self.s0, self._ms, 0.05).clamp(min=0.001).view(1, 1, -1)
         h = self._mod(self.h0, self._mh, 0.3).clamp(min=0.001).view(1, 1, -1)
@@ -367,46 +457,34 @@ class FlowLeniaCoreML:
             f, p = self._mflow
             flow_scale = 1.0 + 0.3 * torch.sin(f * self.t + p).mean().item() * cfg.mod_depth
 
-        # ── FFT in float32 (precision-sensitive) ──
+        # FFT in float32
         fA = torch.fft.fft2(A, dim=(0, 1))
         U = torch.fft.ifft2(fK * fA[:, :, self._c0], dim=(0, 1)).real
 
-        # ── Growth + Flow + Advection in float16 ──
-        if USE_FP16:
-            U_h = U.half()
-            A_h = A.half()
-            m_h, s_h, h_h = m.half(), s.half(), h.half()
-            dt_h = torch.tensor(dt_mod, device=DEVICE, dtype=torch.float16)
-            fs_h = torch.tensor(flow_scale, device=DEVICE, dtype=torch.float16)
-            sw_c, sw_1, lw = self._sw_c_h, self._sw_1_h, self._lw_h
-            c1, pi, pj = self._c1_h, self._pi_h, self._pj_h
-        else:
-            U_h, A_h = U, A
-            m_h, s_h, h_h = m, s, h
-            dt_h = torch.tensor(dt_mod, device=DEVICE)
-            fs_h = torch.tensor(flow_scale, device=DEVICE)
-            sw_c, sw_1, lw = self._sw_c, self._sw_1, self._lw
-            c1, pi, pj = self._c1, self._pi, self._pj
+        m_h = m.half() if USE_FP16 else m
+        s_h = s.half() if USE_FP16 else s
+        h_h = h.half() if USE_FP16 else h
+        A_h = A.half() if USE_FP16 else A
 
         nw = self._step_core(
-            U_h, A_h, m_h, s_h, h_h, dt_h, fs_h,
-            sw_c, sw_1, lw, c1, pi, pj,
-            float(X), float(Y), C, cfg.growth_inject, cfg.diffusion,
+            U, A, A_h, m_h, s_h, h_h, self._c1_h,
+            self._sw_c, self._sw_1, self._lw,
+            self._pi, self._pj,
+            dt_mod, flow_scale, float(X), float(Y), C,
+            cfg.growth_inject, cfg.diffusion,
         )
 
-        # Soft mass damping
-        nw_f = nw.float()
         target = 0.20
-        cur = nw_f.mean()
+        cur = nw.mean()
         if cur > 1e-8:
             ratio = target / cur
-            nw_f = nw_f * (1.0 + 0.05 * (ratio - 1.0))
+            nw = nw * (1.0 + 0.05 * (ratio - 1.0))
 
-        return nw_f.clamp(0.0, 1.0)
+        return nw.clamp(0.0, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GPU Shader Effects (same as gpu version)
+#  GPU Shader Effects
 # ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -440,21 +518,23 @@ def thin_film_interference(thickness, angle):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Renderer — with CoreML ANE path
+#  Renderer — upscales sim to display resolution
 # ══════════════════════════════════════════════════════════════════════
 
 class LiquidRendererCoreML:
-    def __init__(self, X, Y, device):
+    def __init__(self, sim_x, sim_y, display_size, device):
         self.device = device
-        self.X, self.Y = X, Y
+        self.sim_x, self.sim_y = sim_x, sim_y
+        self.display_size = display_size
 
-        gi = torch.linspace(0, 1, X, device=device)
-        gj = torch.linspace(0, 1, Y, device=device)
+        # Shader grids at display resolution
+        gi = torch.linspace(0, 1, display_size, device=device)
+        gj = torch.linspace(0, 1, display_size, device=device)
         pi, pj = torch.meshgrid(gi, gj, indexing="ij")
         self.pos = torch.stack([pi, pj], dim=-1)
 
-        base_i = torch.linspace(-1, 1, X, device=device)
-        base_j = torch.linspace(-1, 1, Y, device=device)
+        base_i = torch.linspace(-1, 1, display_size, device=device)
+        base_j = torch.linspace(-1, 1, display_size, device=device)
         bi, bj = torch.meshgrid(base_i, base_j, indexing="ij")
         self._base_grid = torch.stack([bj, bi], dim=-1).unsqueeze(0)
 
@@ -462,7 +542,6 @@ class LiquidRendererCoreML:
         self.thin_film_on = False
         self.distort_on = True
 
-        # CoreML rendering model
         self._coreml_model = None
         self._coreml_active = False
 
@@ -471,14 +550,21 @@ class LiquidRendererCoreML:
             self._coreml_model = model
             self._coreml_active = True
 
-    def _to_lum(self, A):
-        return 0.299 * A[:, :, 0] + 0.587 * A[:, :, 1] + 0.114 * A[:, :, 2]
+    def _upscale(self, A):
+        """Upscale (X,Y,C) sim state to (display,display,C) with bilinear."""
+        img = A.permute(2, 0, 1).unsqueeze(0)
+        up = F.interpolate(img, size=(self.display_size, self.display_size),
+                           mode='bilinear', align_corners=False)
+        return up
 
-    def _tonemap(self, lum):
-        lum = lum * 2.5
-        lum = lum / (1.0 + lum)
-        lum = lum * lum * (3.0 - 2.0 * lum)
-        return lum
+    def _to_lum_nchw(self, img):
+        return 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+
+    def _tonemap_nchw(self, img):
+        img = img * 2.5
+        img = img / (1.0 + img)
+        img = img * img * (3.0 - 2.0 * img)
+        return img
 
     def _apply_distort(self, img_nchw, t):
         breath = 0.015 + 0.01 * math.sin(t * 0.005) + 0.005 * math.sin(t * 0.013)
@@ -491,7 +577,7 @@ class LiquidRendererCoreML:
         return F.grid_sample(img_nchw, grid, mode='bilinear',
                              padding_mode='zeros', align_corners=True)
 
-    def _apply_glow_mps(self, img_nchw):
+    def _apply_glow(self, img_nchw):
         bright = (img_nchw - 0.3).clamp(min=0.0) * 1.5
         s1 = F.avg_pool2d(bright, 4, stride=4)
         g1 = F.interpolate(s1, size=img_nchw.shape[2:], mode='bilinear', align_corners=False)
@@ -500,19 +586,23 @@ class LiquidRendererCoreML:
         return (img_nchw + g1 * 0.35 + g2 * 0.5).clamp(0.0, 1.0)
 
     def _render_coreml(self, img_nchw):
-        """Render tone mapping + glow on ANE via CoreML."""
-        # MPS → numpy (zero-copy on Apple Silicon unified memory)
         inp = img_nchw.cpu().numpy().astype(np.float32)
         result = self._coreml_model.predict({"img": inp})
-        # Find the output key
         out_key = list(result.keys())[0]
         rendered = np.array(result[out_key])
         return torch.from_numpy(rendered).to(self.device)
 
+    def _to_numpy_bgr(self, img_nchw):
+        return np.ascontiguousarray(
+            (img_nchw.squeeze(0)[[2, 1, 0]].permute(1, 2, 0).clamp(0, 1) * 255)
+            .byte().cpu().numpy())
+
     @torch.no_grad()
     def render_mono(self, A, t):
-        lum = self._tonemap(self._to_lum(A.clamp(0.0, 1.0)))
-        img = lum.unsqueeze(0).unsqueeze(0).expand(-1, 3, -1, -1).clone()
+        img = self._upscale(A.clamp(0.0, 1.0))
+        lum = self._to_lum_nchw(img)
+        lum = self._tonemap_nchw(lum)
+        img = lum.expand(-1, 3, -1, -1).clone()
 
         if self.distort_on:
             img = self._apply_distort(img, t)
@@ -520,18 +610,20 @@ class LiquidRendererCoreML:
             if self._coreml_active:
                 img = self._render_coreml(img)
             else:
-                img = self._apply_glow_mps(img)
+                img = self._apply_glow(img)
 
         return np.ascontiguousarray(
             (img.squeeze(0).permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy())
 
     @torch.no_grad()
     def render_mono_warm(self, A, t):
-        lum = self._tonemap(self._to_lum(A.clamp(0.0, 1.0)))
+        img = self._upscale(A.clamp(0.0, 1.0))
+        lum = self._to_lum_nchw(img)
+        lum = self._tonemap_nchw(lum)
         r = lum.pow(0.75)
         g = lum.pow(1.1) * 0.8
         b = lum.pow(1.8) * 0.4
-        img = torch.stack([r, g, b], dim=0).unsqueeze(0)
+        img = torch.cat([r, g, b], dim=1)
 
         if self.distort_on:
             img = self._apply_distort(img, t)
@@ -539,55 +631,46 @@ class LiquidRendererCoreML:
             if self._coreml_active:
                 img = self._render_coreml(img)
             else:
-                img = self._apply_glow_mps(img)
+                img = self._apply_glow(img)
 
-        return np.ascontiguousarray(
-            (img.squeeze(0)[[2, 1, 0]].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy())
+        return self._to_numpy_bgr(img)
 
     @torch.no_grad()
     def render_liquid(self, A, t):
-        out = A.clamp(0.0, 1.0)
+        img = self._upscale(A.clamp(0.0, 1.0))
 
         if self.thin_film_on:
-            lum = self._to_lum(out)
+            lum = self._to_lum_nchw(img).squeeze(0).squeeze(0)
             flow1 = gpu_fbm2(self.pos, t * 0.015, scale=2.0, speed=0.08)
             flow2 = gpu_fbm2(self.pos + 40.0, t * 0.02, scale=3.5, speed=0.12)
             thickness = 200.0 + 350.0 * (flow1 * 0.5 + 0.5) + 120.0 * flow2 + lum * 150.0
             angle = 0.2 + 0.35 * (flow2 * 0.5 + 0.5)
             film = thin_film_interference(thickness, angle)
             activity = lum.unsqueeze(-1).clamp(0.0, 1.0)
-            out = out * 0.6 + film * activity * 0.4
+            out_hwc = img.squeeze(0).permute(1, 2, 0)
+            out_hwc = out_hwc * 0.6 + film * activity * 0.4
+            img = out_hwc.permute(2, 0, 1).unsqueeze(0)
 
-        if self._coreml_active and self.glow_on:
-            # Use CoreML for tone mapping + glow (ANE)
-            img = out.permute(2, 0, 1).unsqueeze(0)
-            if self.distort_on:
-                img = self._apply_distort(img, t)
-            img = self._render_coreml(img)
-            return np.ascontiguousarray(
-                (img.squeeze(0)[[2, 1, 0]].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy())
+        img = self._tonemap_nchw(img)
+        lum2 = self._to_lum_nchw(img)
+        img = lum2 + (img - lum2) * 1.8
+        img = img.clamp(0.0, 1.0)
 
-        # MPS fallback: tone map
-        out = out * 2.5
-        out = out / (1.0 + out)
-        out = out * out * (3.0 - 2.0 * out)
-        lum2 = (0.299 * out[:, :, 0] + 0.587 * out[:, :, 1] + 0.114 * out[:, :, 2]).unsqueeze(-1)
-        out = lum2 + (out - lum2) * 1.8
-        out = out.clamp(0.0, 1.0)
-
-        img = out.permute(2, 0, 1).unsqueeze(0)
         if self.distort_on:
             img = self._apply_distort(img, t)
-        if self.glow_on:
-            img = self._apply_glow_mps(img)
 
-        return np.ascontiguousarray(
-            (img.squeeze(0)[[2, 1, 0]].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy())
+        if self.glow_on:
+            if self._coreml_active:
+                img = self._render_coreml(img)
+            else:
+                img = self._apply_glow(img)
+
+        return self._to_numpy_bgr(img)
 
     @torch.no_grad()
     def render_direct(self, A):
-        return np.ascontiguousarray(
-            (A[:, :, [2, 1, 0]].clamp(0, 1) * 255).byte().cpu().numpy())
+        img = self._upscale(A.clamp(0.0, 1.0))
+        return self._to_numpy_bgr(img)
 
 
 # ── Perturbation ──
@@ -615,8 +698,6 @@ def add_perturbation(A, x, y, device):
 # ══════════════════════════════════════════════════════════════════════
 
 def run_benchmark(fl, fK, A, n_steps=50):
-    """Benchmark simulation throughput."""
-    # Warm-up
     for _ in range(5):
         A = fl.step(A, fK)
     if DEVICE.type == "mps":
@@ -641,7 +722,6 @@ def run_benchmark(fl, fK, A, n_steps=50):
 PATTERNS = ["dense_noise", "random_center", "random_spots", "circle", "noise"]
 PATTERN_KEYS = {ord(str(i + 1)): i for i in range(5)}
 WINDOW_NAME = "Flow Lenia (CoreML)"
-DISPLAY_SIZE = 1024
 
 
 def mouse_callback(event, x, y, flags, param):
@@ -655,7 +735,7 @@ def main():
 
     print(f"Flow Lenia — CoreML Optimized")
     print(f"  Device: {DEVICE}")
-    print(f"  Precision: {'float16 + float32 (mixed)' if USE_FP16 else 'float32'}")
+    print(f"  Precision: {'mixed (fp16 growth/data + fp32 coords)' if USE_FP16 else 'float32'}")
     print(f"  CoreML: {'available' if HAS_COREML else 'not installed (pip install coremltools)'}")
 
     fl = FlowLeniaCoreML(cfg, seed=seed)
@@ -663,31 +743,31 @@ def main():
     fK = fl.get_fK()
     A = fl.init_pattern("dense_noise", seed=seed)
 
-    renderer = LiquidRendererCoreML(cfg.X, cfg.Y, DEVICE)
+    renderer = LiquidRendererCoreML(cfg.X, cfg.Y, DISPLAY_SIZE, DEVICE)
 
-    # Build CoreML rendering model
     if HAS_COREML:
         print("  Building CoreML render model ...")
-        coreml_model = build_coreml_render_model(cfg.X, cfg.Y)
+        coreml_model = build_coreml_render_model(DISPLAY_SIZE, DISPLAY_SIZE)
         if coreml_model:
             renderer.enable_coreml(coreml_model)
             print("  CoreML ANE rendering: enabled")
+
+    evolver = ParamEvolver(cfg)
 
     CMAP_NAMES = ["mono", "mono_warm", "liquid", "direct"]
 
     print(f"\n  Sim: {cfg.X}x{cfg.Y} C={cfg.C} k={cfg.k}")
     print(f"  Display: {DISPLAY_SIZE}x{DISPLAY_SIZE}")
+    print(f"  Auto-evolution: every {cfg.evolve_interval:.0f}s (transition {cfg.evolve_duration:.0f}s)")
     print()
     print("  SPACE=pause  r=reset  q/ESC=quit  s=screenshot  f=fullscreen")
     print("  c=colormap  +/-=steps  m=modulation  g=glow  t=thin-film  d=distort")
-    print("  b=benchmark  1-5=pattern  mouse=perturbation")
+    print("  e=auto-evolution  b=benchmark  1-5=pattern  mouse=perturbation")
 
-    # Benchmark
-    print("\nBenchmark ...")
+    print("\nBenchmark (sim only) ...")
     bench_fps, bench_ms, A = run_benchmark(fl, fK, A, n_steps=50)
     print(f"  {bench_fps:.1f} FPS ({bench_ms:.1f} ms/step)")
 
-    # Re-init after benchmark
     A = fl.init_pattern("dense_noise", seed=seed)
     print("\nWarm-up ...")
     for _ in range(5):
@@ -703,6 +783,7 @@ def main():
     screenshot_counter = 0
     click_param = {"click": None}
     colormap_mode = 0
+    fK_refresh_counter = 0
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, DISPLAY_SIZE, DISPLAY_SIZE)
@@ -728,6 +809,16 @@ def main():
                                      max(0, min(cfg.Y - 1, sy)), DEVICE)
                 click_param["click"] = None
 
+            # Parameter evolution
+            if not paused and evolver.evolving:
+                changed = evolver.update(fl)
+                if changed:
+                    fK_refresh_counter += 1
+                    # Refresh kernel every 10 frames during transition (not every frame)
+                    if fK_refresh_counter >= 10:
+                        fK = fl.get_fK()
+                        fK_refresh_counter = 0
+
             if not paused:
                 for _ in range(steps_per_frame):
                     A = fl.step(A, fK)
@@ -750,14 +841,18 @@ def main():
 
             status = "PAUSED" if paused else f"step {step_count}"
             mod_str = "MOD" if fl.modulation_on else "---"
+            evo_str = "EVO" if evolver.evolving else "---"
+            trans_str = "*" if evolver.transitioning else ""
             fx = ""
             if colormap_mode <= 2:
                 fx += "G" if renderer.glow_on else ""
                 fx += "D" if renderer.distort_on else ""
                 fx += "T" if renderer.thin_film_on else ""
             coreml_str = " [ANE]" if renderer._coreml_active else ""
-            prec_str = "fp16" if USE_FP16 else "fp32"
-            info = f"FPS:{fps:.0f} x{steps_per_frame} | {status} | {CMAP_NAMES[colormap_mode]} {mod_str} {fx} | {prec_str}{coreml_str}"
+            prec_str = "fp16+fp32" if USE_FP16 else "fp32"
+            info = (f"FPS:{fps:.0f} x{steps_per_frame} | {status} | "
+                    f"{CMAP_NAMES[colormap_mode]} {mod_str} {evo_str}{trans_str} {fx} | "
+                    f"{prec_str}{coreml_str}")
             cv2.putText(display, info, (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(display, info, (10, 25),
@@ -775,6 +870,7 @@ def main():
                 fl = FlowLeniaCoreML(cfg, seed=seed)
                 fK = fl.get_fK()
                 A = fl.init_pattern(current_pattern, seed=seed)
+                evolver = ParamEvolver(cfg)
                 for _ in range(5):
                     A = fl.step(A, fK)
                 step_count = 0
@@ -794,6 +890,9 @@ def main():
             elif key == ord('m'):
                 fl.modulation_on = not fl.modulation_on
                 print(f"Modulation: {'ON' if fl.modulation_on else 'OFF'}")
+            elif key == ord('e'):
+                evolver.evolving = not evolver.evolving
+                print(f"Auto-evolution: {'ON' if evolver.evolving else 'OFF'}")
             elif key == ord('g'):
                 renderer.glow_on = not renderer.glow_on
                 print(f"Glow: {'ON' if renderer.glow_on else 'OFF'}")
